@@ -7,11 +7,15 @@
 #
 import os
 from copy import deepcopy
+import sys
 
 import neat
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import tensorflow as tf
+import multiprocessing as mp
+from functools import partial
 
 from covid_xprize.examples.prescriptors.neat.utils import PRED_CASES_COL, prepare_historical_df, CASES_COL, IP_COLS, \
     IP_MAX_VALUES, add_geo_id, get_predictions
@@ -77,23 +81,18 @@ eval_start_date = pd.to_datetime(EVAL_START_DATE, format='%Y-%m-%d')
 eval_end_date = pd.to_datetime(EVAL_END_DATE, format='%Y-%m-%d')
 
 
-# Function that evaluates the fitness of each prescriptor model
-def eval_genomes(genomes, config):
+class Evaluator:
+    def __init__(self, w1, w2):
+        self.cost_df = None
+        self.geo_costs = {}
+        self.w1, self.w2 = w1, w2
+        
+    def initialize_worker():
+        global lock
+        lock = mp.Lock()
 
-    # Every generation sample a different set of costs per geo,
-    # so that over time solutions become robust to different costs.
-    cost_df = generate_costs(distribution='uniform')
-    cost_df = add_geo_id(cost_df)
-    geo_costs = {}
-    for geo in eval_geos:
-        costs = cost_df[cost_df['GeoID'] == geo]
-        if len(costs) <= 0:
-            continue
-        cost_arr = np.array(costs[IP_COLS])[0]
-        geo_costs[geo] = cost_arr
-
-    # Evaluate each individual
-    for genome_id, genome in genomes:
+    def eval_single_genome(self, args):
+        genome_id, genome = args
 
         # Create net from genome
         net = neat.nn.FeedForwardNetwork.create(genome, config)
@@ -117,14 +116,14 @@ def eval_genomes(genomes, config):
 
             # Prescribe for each geo
             for geo in eval_geos:
-                if len(cost_df[cost_df['GeoID'] == geo]) <= 0:
+                if len(self.cost_df[self.cost_df['GeoID'] == geo]) <= 0:
                     continue
 
                 # Prepare input data. Here we use log to place cases
                 # on a reasonable scale; many other approaches are possible.
                 X_cases = np.log(eval_past_cases[geo][-NB_LOOKBACK_DAYS:] + 1)
                 X_ips = eval_past_ips[geo][-NB_LOOKBACK_DAYS:]
-                X_costs = geo_costs[geo]
+                X_costs = self.geo_costs[geo]
                 X = np.concatenate([X_cases.flatten(),
                                     X_ips.flatten(),
                                     X_costs])
@@ -148,22 +147,23 @@ def eval_genomes(genomes, config):
                 # Update stringency. This calculation could include division by
                 # the number of IPs and/or number of geos, but that would have
                 # no effect on the ordering of candidate solutions.
-                stringency += np.sum(geo_costs[geo] * prescribed_ips)
+                stringency += np.sum(self.geo_costs[geo] * prescribed_ips)
 
             # Create dataframe from prescriptions.
             pres_df = pd.DataFrame(df_dict)
 
             # Make prediction given prescription for all countries
-            pred_df = get_predictions(EVAL_START_DATE, date_str, pres_df)
+            with lock:
+                pred_df = get_predictions(EVAL_START_DATE, date_str, pres_df)
 
             # Update past data with new day of prescriptions and predictions
-            pres_df['GeoID'] = pres_df['CountryName'] + '__' + pres_df['RegionName'].astype(str)
+            pres_df['GeoID'] = pres_df['CountryName'].astype(str) + '__' + pres_df['RegionName'].astype(str)
             pred_df['RegionName'] = pred_df['RegionName'].fillna("")
             pred_df['GeoID'] = pred_df['CountryName'] + '__' + pred_df['RegionName'].astype(str)
             new_pres_df = pres_df[pres_df['Date'] == date_str]
             new_pred_df = pred_df[pred_df['Date'] == date_str]
             for geo in eval_geos:
-                if len(cost_df[cost_df['GeoID'] == geo]) <= 0:
+                if len(self.cost_df[self.cost_df['GeoID'] == geo]) <= 0:
                     continue
                 geo_pres = new_pres_df[new_pres_df['GeoID'] == geo]
                 geo_pred = new_pred_df[new_pred_df['GeoID'] == geo]
@@ -186,12 +186,35 @@ def eval_genomes(genomes, config):
         # stringency zero. To achieve more interesting behavior, a different fitness
         # function may be required.
         new_cases = pred_df[PRED_CASES_COL].mean().mean()
-        genome.fitness = -(new_cases * stringency)
+        # genome.fitness = -(new_cases * stringency)
+        genome.fitness = -(new_cases * self.w1 + stringency * self.w2)
 
         print('Evaluated Genome', genome_id)
         print('New cases:', new_cases)
         print('Stringency:', stringency)
         print('Fitness:', genome.fitness)
+        return genome.fitness
+
+    # Function that evaluates the fitness of each prescriptor model
+    def eval_genomes(self, genomes, config):
+
+        # Every generation sample a different set of costs per geo,
+        # so that over time solutions become robust to different costs.
+        self.cost_df = generate_costs(distribution='uniform')
+        self.cost_df = add_geo_id(self.cost_df)
+        for geo in eval_geos:
+            costs = self.cost_df[self.cost_df['GeoID'] == geo]
+            if len(costs) <= 0:
+                continue
+            cost_arr = np.array(costs[IP_COLS])[0]
+            self.geo_costs[geo] = cost_arr
+
+        # Evaluate each individual
+        with tf.device('/CPU:0'):
+            with mp.Pool(len(genomes), initializer=self.initialize_worker) as pl:
+                scores = list(pl.map(self.eval_single_genome, zip(genomes, [mp.Lock()] * len(genomes))))
+        for (_, genome), s in zip(genomes, scores):
+            genome.fitness = s
 
 
 # Load configuration.
@@ -209,16 +232,18 @@ p.add_reporter(neat.StdOutReporter(show_species_detail=True))
 stats = neat.StatisticsReporter()
 p.add_reporter(stats)
 
+arg = float(sys.argv[1])
 # Add checkpointer to save population every generation and every 10 minutes.
 p.add_reporter(neat.Checkpointer(generation_interval=1,
                                  time_interval_seconds=600,
-                                 filename_prefix='neat-checkpoint-'))
+                                 filename_prefix=f'neat-checkpoint-weight{arg}-'))
 
 # Run until a solution is found. Since a "solution" as defined in our config
 # would have 0 fitness, this will run indefinitely and require manual stopping,
 # unless evolution finds the solution that uses 0 for all ips. A different
 # value can be placed in the config for automatic stopping at other thresholds.
-winner = p.run(eval_genomes)
+e = Evaluator(arg, 1 - arg)
+winner = p.run(e.eval_genomes, 4)
 
 # At any time during evolution, we can inspect the latest saved checkpoint
 # neat-checkpoint-* to see how well it is doing.
