@@ -1,4 +1,5 @@
-# Copyright 2020 (c) Cognizant Digital Business, Evolutionary AI. All rights reserved. Issued under the Apache 2.0 License.
+# Copyright 2020 (c) Cognizant Digital Business, Evolutionary AI. All
+# rights reserved. Issued under the Apache 2.0 License.
 
 #
 # Example script for training neat-based prescriptors
@@ -57,7 +58,7 @@ df = df[df['Date'] <= cutoff_date]
 # As a heuristic, use the top NB_EVAL_COUNTRIES w.r.t. ConfirmedCases
 # so far as the geos for evaluation.
 eval_geos = list(df.groupby('GeoID', group_keys=False).max()['ConfirmedCases'].sort_values(
-                ascending=False).head(NB_EVAL_COUNTRIES).index)
+    ascending=False).head(NB_EVAL_COUNTRIES).index)
 print("Nets will be evaluated on the following geos:", eval_geos)
 
 # Pull out historical data for all geos
@@ -86,6 +87,8 @@ def eval_genomes(genomes, config):
     geo_costs = {}
     for geo in eval_geos:
         costs = cost_df[cost_df['GeoID'] == geo]
+        if len(costs) <= 0:
+            continue
         cost_arr = np.array(costs[IP_COLS])[0]
         geo_costs[geo] = cost_arr
 
@@ -114,6 +117,8 @@ def eval_genomes(genomes, config):
 
             # Prescribe for each geo
             for geo in eval_geos:
+                if len(cost_df[cost_df['GeoID'] == geo]) <= 0:
+                    continue
 
                 # Prepare input data. Here we use log to place cases
                 # on a reasonable scale; many other approaches are possible.
@@ -158,11 +163,14 @@ def eval_genomes(genomes, config):
             new_pres_df = pres_df[pres_df['Date'] == date_str]
             new_pred_df = pred_df[pred_df['Date'] == date_str]
             for geo in eval_geos:
+                if len(cost_df[cost_df['GeoID'] == geo]) <= 0:
+                    continue
                 geo_pres = new_pres_df[new_pres_df['GeoID'] == geo]
                 geo_pred = new_pred_df[new_pred_df['GeoID'] == geo]
 
                 # Append array of prescriptions
-                pres_arr = np.array([geo_pres[ip_col].values[0] for ip_col in IP_COLS]).reshape(1,-1)
+                pres_arr = np.array([geo_pres[ip_col].values[0]
+                                    for ip_col in IP_COLS]).reshape(1, -1)
                 eval_past_ips[geo] = np.concatenate([eval_past_ips[geo], pres_arr])
 
                 # Append predicted cases
@@ -214,4 +222,3 @@ winner = p.run(eval_genomes)
 
 # At any time during evolution, we can inspect the latest saved checkpoint
 # neat-checkpoint-* to see how well it is doing.
-
