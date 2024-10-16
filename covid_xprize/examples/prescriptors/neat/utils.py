@@ -111,12 +111,18 @@ def load_ips_file(path_to_ips_file):
 def get_predictions(start_date_str, end_date_str, pres_df, countries=None):
 
     # Concatenate prescriptions with historical data
-    raw_df = get_raw_data(HIST_DATA_FILE_PATH)
-    hist_df = generate_scenario(start_date_str, end_date_str, raw_df,
-                                countries=countries, scenario='Historical')
-    start_date = pd.to_datetime(start_date_str, format='%Y-%m-%d')
-    hist_df = hist_df[hist_df.Date < start_date]
-    ips_df = pd.concat([hist_df, pres_df])
+    while True:
+        try:
+            raw_df = get_raw_data(HIST_DATA_FILE_PATH)
+            hist_df = generate_scenario(start_date_str, end_date_str, raw_df,
+                                        countries=countries, scenario='Historical')
+            start_date = pd.to_datetime(start_date_str, format='%Y-%m-%d')
+            hist_df = hist_df[hist_df.Date < start_date]
+            ips_df = pd.concat([hist_df, pres_df])
+        except:
+            continue
+        else:
+            break
 
     with tempfile.NamedTemporaryFile() as tmp_ips_file:
         # Write ips_df to file

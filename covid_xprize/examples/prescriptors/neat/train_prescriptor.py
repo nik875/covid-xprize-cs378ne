@@ -15,7 +15,6 @@ import pandas as pd
 from pathlib import Path
 import tensorflow as tf
 import multiprocessing as mp
-from functools import partial
 
 from covid_xprize.examples.prescriptors.neat.utils import PRED_CASES_COL, prepare_historical_df, CASES_COL, IP_COLS, \
     IP_MAX_VALUES, add_geo_id, get_predictions
@@ -86,10 +85,6 @@ class Evaluator:
         self.cost_df = None
         self.geo_costs = {}
         self.w1, self.w2 = w1, w2
-        
-    def initialize_worker():
-        global lock
-        lock = mp.Lock()
 
     def eval_single_genome(self, args):
         genome_id, genome = args
@@ -153,8 +148,7 @@ class Evaluator:
             pres_df = pd.DataFrame(df_dict)
 
             # Make prediction given prescription for all countries
-            with lock:
-                pred_df = get_predictions(EVAL_START_DATE, date_str, pres_df)
+            pred_df = get_predictions(EVAL_START_DATE, date_str, pres_df)
 
             # Update past data with new day of prescriptions and predictions
             pres_df['GeoID'] = pres_df['CountryName'].astype(str) + '__' + pres_df['RegionName'].astype(str)
@@ -211,8 +205,8 @@ class Evaluator:
 
         # Evaluate each individual
         with tf.device('/CPU:0'):
-            with mp.Pool(len(genomes), initializer=self.initialize_worker) as pl:
-                scores = list(pl.map(self.eval_single_genome, zip(genomes, [mp.Lock()] * len(genomes))))
+            with mp.Pool(len(genomes)) as pl:
+                scores = list(pl.map(self.eval_single_genome, genomes))
         for (_, genome), s in zip(genomes, scores):
             genome.fitness = s
 
@@ -236,14 +230,14 @@ arg = float(sys.argv[1])
 # Add checkpointer to save population every generation and every 10 minutes.
 p.add_reporter(neat.Checkpointer(generation_interval=1,
                                  time_interval_seconds=600,
-                                 filename_prefix=f'neat-checkpoint-weight{arg}-'))
+                                 filename_prefix=f'checkpoints/neat-checkpoint-weight{arg}-'))
 
 # Run until a solution is found. Since a "solution" as defined in our config
 # would have 0 fitness, this will run indefinitely and require manual stopping,
 # unless evolution finds the solution that uses 0 for all ips. A different
 # value can be placed in the config for automatic stopping at other thresholds.
 e = Evaluator(arg, 1 - arg)
-winner = p.run(e.eval_genomes, 4)
+winner = p.run(e.eval_genomes, 5)
 
 # At any time during evolution, we can inspect the latest saved checkpoint
 # neat-checkpoint-* to see how well it is doing.
